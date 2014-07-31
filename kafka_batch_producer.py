@@ -4,6 +4,7 @@ import logging
 from kafka.common import ProduceRequest
 from kafka.partitioner import HashedPartitioner
 from kafka.protocol import create_message
+from collections import defaultdict
 
 log = logging.getLogger("kafka")
 
@@ -60,26 +61,23 @@ class BatchProducer(object):
         """
         Helper method to send produce requests
         """
-        reqs = []
-        sub_reqs = []
         msg_size = 0
-        for key, msg in key_msg_list:
-            req = ProduceRequest(topic,
-                                 self._next_partition(topic, key),
-                                 [create_message(msg)])
-            if msg_size + len(req.messages[0]) < self.message_limit:
-                sub_reqs.append(req)
-                msg_size += len(req.messages)
-            else:
-                reqs.append(sub_reqs)
-                sub_reqs = [req]
-                msg_size = len(req.messages)
-        else:
-            reqs.append(sub_reqs)
+        msgset = defaultdict(list)
+        resps = []
         try:
-            resps = []
-            for sub_reqs in reqs:
-                resps.extend(self.client.send_produce_request(sub_reqs, acks=self.req_acks,
+            for key, msg in key_msg_list:
+                msg_str = create_message(msg)
+                if msg_size + len(msg_str) > self.message_limit:
+                    reqs = list(ProduceRequest(topic, key, msgs) for key, msgs in msgset.iteritems())
+                    resps.extend(self.client.send_produce_request(reqs, acks=self.req_acks,
+                                                                  timeout=self.ack_timeout))
+                    msgset = defaultdict(list)
+                    msg_size = 0
+                msgset[self._next_partition(topic, key)].append(msg_str)
+                msg_size = msg_size + len(msg_str)
+            else:
+                reqs = list(ProduceRequest(topic, key, msgs) for key, msgs in msgset.iteritems())
+                resps.extend(self.client.send_produce_request(reqs, acks=self.req_acks,
                                                               timeout=self.ack_timeout))
         except Exception:
             log.exception("Unable to send messages")
