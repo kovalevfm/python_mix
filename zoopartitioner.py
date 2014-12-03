@@ -1,24 +1,3 @@
-"""Zookeeper Partitioner Implementation
-
-:Maintainer: None
-:Status: Unknown
-
-:class:`ZooSetPartitioner` implements a partitioning scheme using
-Zookeeper for dividing up resources amongst members of a party.
-
-This is useful when there is a set of resources that should only be
-accessed by a single process at a time that multiple processes
-across a cluster might want to divide up.
-
-Set is children of zookeeper path/
-
-Example Use-Case
-----------------
-
-- Multiple workers across a cluster need to divide up a list of queues
-  so that no two workers own the same queue.
-
-"""
 import logging
 import os
 import socket
@@ -33,51 +12,39 @@ import time
 log = logging.getLogger(__name__)
 
 
-class PatientNChildrenWatch(object):
-    """Patient N Children Watch that returns values after the children
-    of a N nodes don't change for a period of time
-
-    A separate watcher for the children of a nodes, that ignores
-    changes within a boundary time and sets the result only when the
-    boundary time has elapsed with no children changes.
-
-    Example::
-
-        watcher = PatientNChildrenWatch(client, ['/some/path1', '/some/path2'],
-                                       time_boundary=5)
-        async_object = watcher.start()
-
-        # Blocks until the children have not changed for time boundary
-        # (5 in this case) seconds, returns children list and an
-        # async_result that will be set if the children change in the
-        # future
-        children, child_async = async_object.get()
-        children1, children2 = children
-
-    .. note::
-
-        This Watch is different from :class:`DataWatch` and
-        :class:`ChildrenWatch` as it only returns once, does not take
-        a function that is called, and provides an
-        :class:`~kazoo.interfaces.IAsyncResult` object that can be
-        checked to see if the children have changed later.
-
-    """
-    def __init__(self, client, paths, time_boundary=30):
+class PatientChildrenKeyWatch(object):
+    def __init__(self, client, paths, keys, time_boundary=30):
         self.client = client
         self.paths = paths
+        self.keys = keys
         self.children = []
+        self.values = []
         self.time_boundary = time_boundary
         self.children_changed = client.handler.event_object()
+        self.async_result = None
+        self._stopped = True
+        self._suspended = False
+        self.client.add_listener(self._session_watcher)
+
+    def _get_children(self):
+        children, values = [], []
+        for path in self.paths:
+            children.append(self.client.retry(self.client.get_children, path, self._children_watcher))
+        for key in self.keys:
+            values.append(self.client.retry(self.client.get, key, self._children_watcher)[0])
+        return children, values
+
+    def _check_children(self):
+        """
+            Check if children where changed during suspended connection
+        """
+        def froze_list(l):
+            return frozenset(frozenset(child) for child in l)
+        children, values = self._get_children()
+        if froze_list(children) != froze_list(self.children) or frozenset(values) != frozenset(self.values):
+            self._children_watcher()
 
     def start(self):
-        """Begin the watching process asynchronously
-
-        :returns: An :class:`~kazoo.interfaces.IAsyncResult` instance
-                  that will be set when no change has occurred to the
-                  children for time boundary seconds.
-
-        """
         self.asy = asy = self.client.handler.async_result()
         self.client.handler.spawn(self._inner_start)
         return asy
@@ -85,121 +52,54 @@ class PatientNChildrenWatch(object):
     def _inner_start(self):
         try:
             while True:
-                self.children = []
-                async_result = self.client.handler.async_result()
-                for path in self.paths:
-                    self.children.append(self.client.retry(
-                        self.client.get_children, path,
-                        partial(self._children_watcher, async_result)))
+                self.async_result = self.client.handler.async_result()
+                self.children, self.values = self._get_children()
                 self.client.handler.sleep_func(self.time_boundary)
-
                 if self.children_changed.is_set():
                     self.children_changed.clear()
                 else:
                     break
-
-            self.asy.set((self.children, async_result))
+            self._suspended = False
+            self._stopped = False
+            self.asy.set((self.children, self.values, self.async_result))
         except Exception as exc:
             self.asy.set_exception(exc)
 
-    def _children_watcher(self, async, event):
+    def _children_watcher(self, event=None):
         self.children_changed.set()
-        async.set(time.time())
+        if not self._stopped:
+            self.async_result.set(time.time())
+            self._stopped = True
+
+    def _session_watcher(self, state):
+        if state in (KazooState.LOST, KazooState.SUSPENDED):
+            self._suspended = True
+        elif (state == KazooState.CONNECTED):
+            if (self._suspended and not self._stopped):
+                self.client.handler.spawn(self._check_children)
+            self._suspended = False
 
 
-class ZooSetPartitioner(object):
-    """Partitions a set amongst members of a party
 
-    This class will partition a set amongst members of a party such
-    that each member will be given zero or more items of the set and
-    each set item will be given to a single member. When new members
-    enter or leave the party, the set will be re-partitioned amongst
-    the members.
-
-    When the :class:`SetPartitioner` enters the
-    :attr:`~PartitionState.FAILURE` state, it is unrecoverable
-    and a new :class:`SetPartitioner` should be created.
-
-    Example:
-
-    .. code-block:: python
-
-        from kazoo.client import KazooClient
-        client = KazooClient()
-
-        qp = client.SetPartitioner(
-            path='/work_queues', set=('queue-1', 'queue-2', 'queue-3'))
-
-        while 1:
-            if qp.failed:
-                raise Exception("Lost or unable to acquire partition")
-            elif qp.release:
-                qp.release_set()
-            elif qp.acquired:
-                for partition in qp:
-                    # Do something with each partition
-            elif qp.allocating:
-                qp.wait_for_acquire()
-
-    **State Transitions**
-
-    When created, the :class:`SetPartitioner` enters the
-    :attr:`PartitionState.ALLOCATING` state.
-
-    :attr:`~PartitionState.ALLOCATING` ->
-    :attr:`~PartitionState.ACQUIRED`
-
-        Set was partitioned successfully, the partition list assigned
-        is accessible via list/iter methods or calling list() on the
-        :class:`SetPartitioner` instance.
-
-    :attr:`~PartitionState.ALLOCATING` ->
-    :attr:`~PartitionState.FAILURE`
-
-        Allocating the set failed either due to a Zookeeper session
-        expiration, or failure to acquire the items of the set within
-        the timeout period.
-
-    :attr:`~PartitionState.ACQUIRED` ->
-    :attr:`~PartitionState.RELEASE`
-
-        The members of the party have changed, and the set needs to be
-        repartitioned. :meth:`SetPartitioner.release` should be called
-        as soon as possible.
-
-    :attr:`~PartitionState.ACQUIRED` ->
-    :attr:`~PartitionState.FAILURE`
-
-        The current partition was lost due to a Zookeeper session
-        expiration.
-
-    :attr:`~PartitionState.RELEASE` ->
-    :attr:`~PartitionState.ALLOCATING`
-
-        The current partition was released and is being re-allocated.
-
-    """
-    def __init__(self, client, path, partitions_path, partition_func=None,
+class ZooKeyPartitioner(object):
+    def __init__(self, client, path, watch_obj=None, result_func=None, partitions_set=None, partition_func=None,
                  identifier=None, time_boundary=30):
-        """Create a :class:`~SetPartitioner` instance
-
-        :param client: A :class:`~kazoo.client.KazooClient` instance.
-        :param path: The partition path to use.
-        :param set: The set of items to partition.
-        :param partition_func: A function to use to decide how to
-                               partition the set.
-        :param identifier: An identifier to use for this member of the
-                           party when participating. Defaults to the
-                           hostname + process id.
-        :param time_boundary: How long the party members must be stable
-                              before allocation can complete.
-
-        """
         self.state = PartitionState.ALLOCATING
+
+        if (watch_obj and partitions_set) or (not watch_obj and not partitions_set):
+            raise Exception('need or watch_obj or partitions_set, only one not both')
+        if (result_func and partitions_set) or (not result_func and not partitions_set):
+            raise Exception('need or result_func or partitions_set, only one not both')
+        if partitions_set:
+            watch_obj = lambda _client, _path: PatientChildrenKeyWatch(_client, [_path], [], time_boundary)
+            result_func = lambda _result: (partitions_set, _result[2])
+        if not callable(result_func) or not callable(watch_obj):
+            raise Exception('result_func and watch_obj must be callable')
 
         self._client = client
         self._path = path
-        self._partitions_path = partitions_path
+        self._watch_obj = watch_obj
+        self._result_func = result_func
         self._partition_set = []
         self._partition_func = partition_func or self._partitioner
         self._identifier = identifier or '%s-%s' % (
@@ -207,12 +107,10 @@ class ZooSetPartitioner(object):
         self._locks = []
         self._lock_path = '/'.join([path, 'locks'])
         self._party_path = '/'.join([path, 'party'])
-        self._time_boundary = time_boundary
 
         self._acquire_event = client.handler.event_object()
 
         # Create basic path nodes
-        client.ensure_path(partitions_path)
         client.ensure_path(path)
         client.ensure_path(self._lock_path)
         client.ensure_path(self._party_path)
@@ -307,8 +205,7 @@ class ZooSetPartitioner(object):
             self._fail_out()
             return
 
-        children, async_result = result.get()
-        self._set = children[1]
+        self._set, async_result = self._result_func(result.get())
         self._children_updated = False
 
         # Add a callback when children change on the async_result
@@ -332,7 +229,7 @@ class ZooSetPartitioner(object):
                 return self._abort_lock_acquisition()
 
             lock = self._client.Lock(self._lock_path + '/' +
-                                     str(member))
+                                     str(member), identifier=self._identifier)
             try:
                 lock.acquire()
             except KazooException:  # pragma: nocover
@@ -379,8 +276,7 @@ class ZooSetPartitioner(object):
         any callbacks might run.
 
         """
-        watcher = PatientNChildrenWatch(self._client, [self._party_path, self._partitions_path],
-                                        self._time_boundary)
+        watcher = self._watch_obj(self._client, self._party_path)
         asy = watcher.start()
         if func is not None:
             # We spin up the function in a separate thread/greenlet
@@ -418,8 +314,32 @@ class ZooSetPartitioner(object):
         # Ensure consistent order of partitions/members
         all_partitions = sorted(partitions)
         workers = sorted(members)
-
         i = workers.index(identifier)
+        logging.warn('for partitioners {0} and workers {1} worker {2}::{3} choose {4}'.format(all_partitions, workers, i, identifier, all_partitions[i::len(workers)]))
         # Now return the partition list starting at our location and
         # skipping the other workers
         return all_partitions[i::len(workers)]
+
+
+def partitioner_wrapper(partitioner_obj):
+    pos = 0
+    active_partitions = []
+    while True:
+        if partitioner_obj.failed:
+            raise Exception("Lost or unable to acquire partition")
+        elif partitioner_obj.release:
+            partitioner_obj.release_set()
+            active_partitions = []
+        elif partitioner_obj.acquired:
+            if not active_partitions:
+                active_partitions = list(p for p in partitioner_obj)
+                logging.warn(str(active_partitions))
+                if not active_partitions:
+                    time.sleep(10)
+                    continue
+            if pos >= len(active_partitions):
+                pos = 0
+            yield active_partitions[pos]
+            pos = pos + 1
+        elif partitioner_obj.allocating:
+            partitioner_obj.wait_for_acquire()
